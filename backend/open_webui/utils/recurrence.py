@@ -1,6 +1,7 @@
 """Recurrence calculations isolated from application/DB imports for worker processes."""
 
 import logging
+import multiprocessing
 from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -94,6 +95,56 @@ def _next_occurrences(s: str, now: datetime, n: int) -> list[datetime]:
     return occurrences
 
 
+def _mp_worker(conn, s: str, now: datetime, n: int):
+    try:
+        res = _next_occurrences(s, now, n)
+        conn.send((True, res))
+    except Exception as e:
+        conn.send((False, e))
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _run_in_subprocess(s: str, now: datetime, n: int, timeout: float) -> list[datetime]:
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(target=_mp_worker, args=(child_conn, s, now, n))
+    p.daemon = True
+    p.start()
+    child_conn.close()
+
+    p.join(timeout=timeout)
+    if p.is_alive():
+        p.terminate()
+        try:
+            p.join(timeout=0.2)
+        except Exception:
+            pass
+        if p.is_alive():
+            try:
+                p.kill()
+            except Exception:
+                pass
+        parent_conn.close()
+        raise TimeoutError("Evaluation timed out")
+
+    if parent_conn.poll():
+        try:
+            success, val = parent_conn.recv()
+        except EOFError:
+            parent_conn.close()
+            raise TimeoutError("Evaluation worker terminated unexpectedly")
+        parent_conn.close()
+        if success:
+            return val
+        raise val
+    parent_conn.close()
+    raise TimeoutError("Evaluation timed out")
+
+
 async def _get_next_occurrences(s: str, now: datetime, n: int) -> list[datetime]:
     # A result-count or date limit cannot bound work before the first match.
     try:
@@ -101,8 +152,9 @@ async def _get_next_occurrences(s: str, now: datetime, n: int) -> list[datetime]
             try:
                 return await to_process.run_sync(_next_occurrences, s, now, n, cancellable=True)
             except (NotImplementedError, OSError):
-                # Fall back to worker thread on Windows SelectorEventLoop or environments lacking subprocess worker support
-                return await to_thread.run_sync(_next_occurrences, s, now, n)
+                # Fall back to an isolated process on Windows SelectorEventLoop or
+                # environments lacking async subprocess transport, preserving hard timeout termination.
+                return await to_thread.run_sync(_run_in_subprocess, s, now, n, RRULE_TIMEOUT_SECONDS)
     except TimeoutError as e:
         raise RecurrenceEvaluationTimeout('Schedule took too long to evaluate; simplify its recurrence rule.') from e
 
